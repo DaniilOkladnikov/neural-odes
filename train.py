@@ -40,6 +40,10 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--system', type=str, default='double_pendulum',
                     choices=list(SYSTEMS.keys()))
+parser.add_argument('--models', type=str, default='both',
+                    choices=['node', 'rnn', 'both'],
+                    help='Which models to train: node (Neural ODE only), '
+                         'rnn (RNN/GRU/LSTM only), both (default)')
 # ODE solver
 parser.add_argument('--method', type=str,
                     choices=['dopri5', 'adams', 'euler', 'rk4'], default='dopri5')
@@ -80,6 +84,17 @@ parser.add_argument('--jac_rampup', type=int, default=5000,
                     help='Iterations over which Jacobian weight ramps from 0 to target')
 parser.add_argument('--jac_samples', type=int, default=256,
                     help='Points subsampled from trajectory for Jacobian estimation')
+# Derivative matching loss (Neural ODE only)
+parser.add_argument('--traj_weight', type=float, default=1.0,
+                    help='Trajectory MSE loss weight')
+parser.add_argument('--deriv_weight', type=float, default=0.1,
+                    help='Derivative matching loss weight (0 to disable)')
+parser.add_argument('--deriv_warmup', type=int, default=0,
+                    help='Iterations before derivative loss starts ramping up')
+parser.add_argument('--deriv_rampup', type=int, default=0,
+                    help='Iterations over which derivative weight ramps from 0 to target')
+parser.add_argument('--deriv_samples', type=int, default=256,
+                    help='Points subsampled from trajectory for derivative matching')
 # Horizon curriculum
 parser.add_argument('--horizon_start_iter', type=int, default=5000,
                     help='Iteration at which to start increasing training horizon')
@@ -310,6 +325,64 @@ def compute_jac_reg(func_net, pred_y, n_samples=256):
 
 
 # ---------------------------------------------------------------------------
+# Derivative matching (true dynamics supervision)
+# ---------------------------------------------------------------------------
+def compute_true_deriv_normalized(y_norm, dynamics_fn, y_mean_sq, y_std_sq):
+    """Compute true dy_norm/dt at sampled points in normalized sin/cos space.
+
+    Converts to physical space, calls analytical dynamics, then applies the
+    chain rule through the sin/cos transformation and normalization.
+    """
+    # Denormalize to sin/cos space
+    y_sc = y_norm * y_std_sq + y_mean_sq                  # (N, repr_dim)
+
+    # Recover physical angles for the dynamics call
+    y_phys = sincos_to_angles(y_sc)                        # (N, state_dim)
+
+    # True derivative in physical space (autonomous, t=0)
+    dy_phys = dynamics_fn(0.0, y_phys)                     # (N, state_dim)
+
+    # Chain rule: convert dy_phys → dy_sincos
+    pieces = []
+    j = 0
+    for i in range(state_dim):
+        if i in angle_indices:
+            sin_val = y_sc[..., j:j+1]
+            cos_val = y_sc[..., j+1:j+2]
+            dtheta = dy_phys[..., i:i+1]
+            pieces.append(cos_val * dtheta)                # d(sin θ)/dt
+            pieces.append(-sin_val * dtheta)               # d(cos θ)/dt
+            j += 2
+        else:
+            pieces.append(dy_phys[..., i:i+1])
+            j += 1
+    dy_sc = torch.cat(pieces, dim=-1)                      # (N, repr_dim)
+
+    # Normalize the derivative
+    return dy_sc / y_std_sq
+
+
+def compute_deriv_loss(func_net, traj_data, dynamics_fn, y_mean_sq, y_std_sq,
+                       n_samples=256):
+    """Derivative matching loss: MSE between network and true vector field.
+
+    Samples random (time, trajectory) pairs from the full pre-computed
+    training dataset for broad state-space coverage.
+    """
+    T, N = traj_data.shape[:2]
+    t_idx = torch.randint(T, (n_samples,), device=traj_data.device)
+    n_idx = torch.randint(N, (n_samples,), device=traj_data.device)
+    y_sample = traj_data[t_idx, n_idx]                     # (n_samples, repr_dim)
+
+    pred_deriv = func_net(y_sample)                        # network prediction
+    with torch.no_grad():
+        true_deriv = compute_true_deriv_normalized(
+            y_sample, dynamics_fn, y_mean_sq, y_std_sq)
+
+    return torch.mean((pred_deriv - true_deriv) ** 2)
+
+
+# ---------------------------------------------------------------------------
 # Evaluation utilities
 # ---------------------------------------------------------------------------
 energy_fn = system['energy_fn']
@@ -366,23 +439,29 @@ if __name__ == '__main__':
     makedirs(model_dir)
 
     # --- Build models (repr_dim inputs/outputs) ---
-    node_func = ODEFunc(repr_dim, args.node_hidden, args.num_layers).to(device)
-    rnn_model = SequencePredictor(repr_dim, args.rnn_hidden, 'rnn',
-                                  args.num_layers).to(device)
-    gru_model = SequencePredictor(repr_dim, args.gru_hidden, 'gru',
-                                  args.num_layers).to(device)
-    lstm_model = SequencePredictor(repr_dim, args.lstm_hidden, 'lstm',
-                                   args.num_layers).to(device)
+    train_node = args.models in ('node', 'both')
+    train_rnn = args.models in ('rnn', 'both')
 
-    models = {
-        'Neural ODE': node_func,
-        'RNN': rnn_model,
-        'GRU': gru_model,
-        'LSTM': lstm_model,
-    }
-    seq_models = {'RNN': rnn_model, 'GRU': gru_model, 'LSTM': lstm_model}
-    names = ['Neural ODE', 'RNN', 'GRU', 'LSTM']
+    models = {}
+    seq_models = {}
+    names = []
     colors = {'Neural ODE': 'blue', 'RNN': 'red', 'GRU': 'orange', 'LSTM': 'purple'}
+
+    if train_node:
+        node_func = ODEFunc(repr_dim, args.node_hidden, args.num_layers).to(device)
+        models['Neural ODE'] = node_func
+        names.append('Neural ODE')
+
+    if train_rnn:
+        rnn_model = SequencePredictor(repr_dim, args.rnn_hidden, 'rnn',
+                                      args.num_layers).to(device)
+        gru_model = SequencePredictor(repr_dim, args.gru_hidden, 'gru',
+                                      args.num_layers).to(device)
+        lstm_model = SequencePredictor(repr_dim, args.lstm_hidden, 'lstm',
+                                       args.num_layers).to(device)
+        seq_models = {'RNN': rnn_model, 'GRU': gru_model, 'LSTM': lstm_model}
+        models.update(seq_models)
+        names.extend(['RNN', 'GRU', 'LSTM'])
 
     print('=' * 50)
     print(f'System: {system["name"]} ({state_dim}D state -> {repr_dim}D sin/cos repr)')
@@ -461,31 +540,34 @@ if __name__ == '__main__':
         print(f'  True FTLE: mean={true_ftle.mean().item():.4f}, '
               f'std={true_ftle.std().item():.4f}')
 
-    # Trajectory viz: 3 fixed ICs
+    # Trajectory viz: 3 fixed ICs, 5s horizon
     n_viz = 3
+    viz_time = 5.0
+    n_viz_points = int(round(viz_time / args.traj_dt)) + 1
+    t_viz = torch.linspace(0., viz_time, n_viz_points).to(device)
     viz_y0_phys = test_y0_phys[0:n_viz]           # (3, 4)
     viz_y0_norm = test_y0_norm[0:n_viz]            # (3, 6)
     with torch.no_grad():
-        viz_true = odeint(dynamics, viz_y0_phys, t, **solver_kwargs)  # (T_viz, 3, 4)
+        viz_true = odeint(dynamics, viz_y0_phys, t_viz, **solver_kwargs)  # (T_viz, 3, 4)
         viz_true[..., 0] = torch.atan2(torch.sin(viz_true[..., 0]), torch.cos(viz_true[..., 0]))
         viz_true[..., 1] = torch.atan2(torch.sin(viz_true[..., 1]), torch.cos(viz_true[..., 1]))
 
     # ------------------------------------------------------------------
     # wandb init
     # ------------------------------------------------------------------
-    use_wandb = HAS_WANDB and not args.no_wandb
-    if use_wandb:
-        wandb.init(project='neural-odes-dp', config=vars(args))
-        for prefix in ['neural_ode', 'rnn', 'gru', 'lstm']:
-            wandb.define_metric(f'{prefix}/step')
-            wandb.define_metric(f'{prefix}/*', step_metric=f'{prefix}/step')
-    elif not args.no_wandb:
-        print('Warning: wandb not installed, logging disabled')
-
     wb_prefix = {
         'Neural ODE': 'neural_ode', 'RNN': 'rnn',
         'GRU': 'gru', 'LSTM': 'lstm',
     }
+    use_wandb = HAS_WANDB and not args.no_wandb
+    if use_wandb:
+        wandb.init(project='neural-odes-dp', config=vars(args))
+        for name in names:
+            prefix = wb_prefix[name]
+            wandb.define_metric(f'{prefix}/step')
+            wandb.define_metric(f'{prefix}/*', step_metric=f'{prefix}/step')
+    elif not args.no_wandb:
+        print('Warning: wandb not installed, logging disabled')
 
     # ------------------------------------------------------------------
     # Real-time plot setup
@@ -496,7 +578,7 @@ if __name__ == '__main__':
     state_labels = system['state_labels']
     n_viz_cols = state_dim + (1 if has_energy else 0)  # 4 state vars + energy
     fig_traj, axes_traj = plt.subplots(n_viz, n_viz_cols, figsize=(4 * n_viz_cols, 3 * n_viz))
-    fig_traj.suptitle(f'Fixed Trajectories ({args.traj_time}s)')
+    fig_traj.suptitle(f'Fixed Trajectories ({viz_time}s)')
 
     log = {name: {
         'iters_fast': [], 'batch_mse': [], 'nfe': [],
@@ -557,7 +639,7 @@ if __name__ == '__main__':
 
     def update_traj_plot(model_name, viz_pred):
         """Update the fixed trajectory figure (3 trajectories x 5 columns)."""
-        t_np = t.cpu().numpy()
+        t_np = t_viz.cpu().numpy()
         col_labels = list(state_labels) + (['Energy'] if has_energy else [])
 
         for ax in axes_traj.flat:
@@ -649,8 +731,8 @@ if __name__ == '__main__':
                                      lyap_delta_norms, T_lyap)
             ftle_err = torch.mean(torch.abs(pred_ftle - true_ftle)).item()
 
-            # Trajectory viz — return 4D for plotting
-            viz_pred_4d = sincos_to_angles(denormalize(odeint(func, viz_y0_norm, t, **solver_kwargs)))
+            # Trajectory viz — return 4D for plotting (5s)
+            viz_pred_4d = sincos_to_angles(denormalize(odeint(func, viz_y0_norm, t_viz, **solver_kwargs)))
 
         return test_mse, ev, dt_val, ftle_err, viz_pred_4d
 
@@ -695,140 +777,169 @@ if __name__ == '__main__':
                                      lyap_delta_norms, T_lyap)
             ftle_err = torch.mean(torch.abs(pred_ftle - true_ftle)).item()
 
-            viz_pred_4d = sincos_to_angles(denormalize(model.predict_trajectory(viz_y0_norm, n_time_points)))
+            viz_pred_4d = sincos_to_angles(denormalize(model.predict_trajectory(viz_y0_norm, n_viz_points)))
 
         return test_mse, ev, dt_val, ftle_err, viz_pred_4d
 
     # ==================================================================
     # Train Neural ODE
     # ==================================================================
-    print('\n=== Training Neural ODE ===')
-    node_optimizer = optim.Adam(node_func.parameters(), lr=args.eta_max,
+    train_time_node = 0.0
+    if train_node:
+        print('\n=== Training Neural ODE ===')
+        node_optimizer = optim.Adam(node_func.parameters(), lr=args.eta_max,
                                 weight_decay=1e-4)
-    node_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        node_optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
-    )
-    start = time.time()
+        node_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            node_optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
+        )
+        start = time.time()
 
-    for itr in range(1, args.niters + 1):
-        node_optimizer.zero_grad()
+        for itr in range(1, args.niters + 1):
+            node_optimizer.zero_grad()
 
-        # Horizon curriculum
-        if itr < args.horizon_start_iter:
-            current_horizon = args.traj_time
-        else:
-            current_horizon = min(
-                args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
-                args.horizon_max
-            )
-        n_current_points = int(round(current_horizon / args.traj_dt)) + 1
+            # Horizon curriculum
+            if itr < args.horizon_start_iter:
+                current_horizon = args.traj_time
+            else:
+                current_horizon = min(
+                    args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
+                    args.horizon_max
+                )
+            n_current_points = int(round(current_horizon / args.traj_dt)) + 1
 
-        batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
+            batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
 
-        node_func.nfe = 0
-        pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
-        nfe = node_func.nfe
+            node_func.nfe = 0
+            pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
+            nfe = node_func.nfe
 
-        traj_loss = torch.mean((pred_y - batch_y) ** 2)
+            if args.traj_weight > 0:
+                traj_loss = torch.mean((pred_y - batch_y) ** 2)
+            else:
+                traj_loss = torch.tensor(0.0, device=device)
 
-        # Energy conservation loss
-        pred_4d = sincos_to_angles(denormalize(pred_y))
-        E_pred = energy_fn(pred_4d, args)                   # (T, batch)
-        E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)    # (1, batch)
-        energy_loss = torch.mean(torch.abs(E_pred - E0))
+            # Energy conservation loss
+            if args.energy_weight > 0:
+                pred_4d = sincos_to_angles(denormalize(pred_y))
+                E_pred = energy_fn(pred_4d, args)                   # (T, batch)
+                E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)    # (1, batch)
+                energy_loss = torch.mean(torch.abs(E_pred - E0))
+            else:
+                energy_loss = torch.tensor(0.0, device=device)
 
-        # Jacobian regularization (Lipschitz continuity)
-        if args.jac_weight > 0:
-            jac_loss = compute_jac_reg(node_func.net, pred_y,
-                                       n_samples=args.jac_samples)
-        else:
-            jac_loss = torch.tensor(0.0, device=device)
+            # Jacobian regularization (Lipschitz continuity)
+            if args.jac_weight > 0:
+                jac_loss = compute_jac_reg(node_func.net, pred_y,
+                                           n_samples=args.jac_samples)
+            else:
+                jac_loss = torch.tensor(0.0, device=device)
 
-        # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
-        if itr <= args.energy_warmup:
-            ew = 0.0
-        elif itr <= args.energy_warmup + args.energy_rampup:
-            ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
-        else:
-            ew = args.energy_weight
+            # Derivative matching loss
+            if args.deriv_weight > 0:
+                y_mean_sq = y_mean.squeeze()
+                y_std_sq = y_std.squeeze()
+                deriv_loss = compute_deriv_loss(node_func.net, train_traj_norm, dynamics,
+                                                y_mean_sq, y_std_sq,
+                                                n_samples=args.deriv_samples)
+            else:
+                deriv_loss = torch.tensor(0.0, device=device)
 
-        # Jacobian weight curriculum
-        if itr <= args.jac_warmup:
-            jw = 0.0
-        elif itr <= args.jac_warmup + args.jac_rampup:
-            jw = args.jac_weight * (itr - args.jac_warmup) / args.jac_rampup
-        else:
-            jw = args.jac_weight
+            # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
+            if itr <= args.energy_warmup:
+                ew = 0.0
+            elif itr <= args.energy_warmup + args.energy_rampup:
+                ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
+            else:
+                ew = args.energy_weight
 
-        loss = traj_loss + ew * energy_loss + jw * jac_loss
-        loss.backward()
-        clip_grad_norm_(node_func.parameters(), max_norm=1.0)
-        node_optimizer.step()
-        node_scheduler.step()
+            # Jacobian weight curriculum
+            if itr <= args.jac_warmup:
+                jw = 0.0
+            elif itr <= args.jac_warmup + args.jac_rampup:
+                jw = args.jac_weight * (itr - args.jac_warmup) / args.jac_rampup
+            else:
+                jw = args.jac_weight
 
-        if itr % args.log_every == 0:
-            with torch.no_grad():
-                batch_mse = torch.mean((pred_y - batch_y) ** 2).item()
+            # Derivative matching weight curriculum
+            if itr <= args.deriv_warmup:
+                dw = 0.0
+            elif itr <= args.deriv_warmup + args.deriv_rampup:
+                dw = args.deriv_weight * (itr - args.deriv_warmup) / args.deriv_rampup
+            else:
+                dw = args.deriv_weight
 
-            log['Neural ODE']['iters_fast'].append(itr)
-            log['Neural ODE']['batch_mse'].append(batch_mse)
-            log['Neural ODE']['nfe'].append(nfe)
+            loss = args.traj_weight * traj_loss + ew * energy_loss + jw * jac_loss + dw * deriv_loss
+            loss.backward()
+            clip_grad_norm_(node_func.parameters(), max_norm=1.0)
+            node_optimizer.step()
+            node_scheduler.step()
 
-            print(f'  Iter {itr:5d} | MSE {batch_mse:.6f} | '
-                  f'E_loss {energy_loss.item():.4f} | ew {ew:.4f} | '
-                  f'J_loss {jac_loss.item():.4f} | jw {jw:.4f} | '
-                  f'NFE {nfe} | horizon {current_horizon:.2f}s')
+            if itr % args.log_every == 0:
+                with torch.no_grad():
+                    batch_mse = torch.mean((pred_y - batch_y) ** 2).item()
 
-            if use_wandb:
-                wandb.log({
-                    'neural_ode/batch_mse': batch_mse,
-                    'neural_ode/energy_loss': energy_loss.item(),
-                    'neural_ode/energy_weight': ew,
-                    'neural_ode/jac_loss': jac_loss.item(),
-                    'neural_ode/jac_weight': jw,
-                    'neural_ode/lr': node_scheduler.get_last_lr()[0],
-                    'neural_ode/nfe': nfe,
-                    'neural_ode/train_horizon': current_horizon,
-                    'neural_ode/step': itr,
-                })
+                log['Neural ODE']['iters_fast'].append(itr)
+                log['Neural ODE']['batch_mse'].append(batch_mse)
+                log['Neural ODE']['nfe'].append(nfe)
 
-            update_batch_plots('Neural ODE')
-            plt.pause(0.001)
+                print(f'  Iter {itr:5d} | MSE {batch_mse:.6f} | '
+                      f'E_loss {energy_loss.item():.4f} | ew {ew:.4f} | '
+                      f'J_loss {jac_loss.item():.4f} | jw {jw:.4f} | '
+                      f'D_loss {deriv_loss.item():.4f} | dw {dw:.4f} | '
+                      f'NFE {nfe} | horizon {current_horizon:.2f}s')
 
-        if itr % args.eval_every == 0:
-            test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_node(node_func)
+                if use_wandb:
+                    wandb.log({
+                        'neural_ode/batch_mse': batch_mse,
+                        'neural_ode/energy_loss': energy_loss.item(),
+                        'neural_ode/energy_weight': ew,
+                        'neural_ode/jac_loss': jac_loss.item(),
+                        'neural_ode/jac_weight': jw,
+                        'neural_ode/deriv_loss': deriv_loss.item(),
+                        'neural_ode/deriv_weight': dw,
+                        'neural_ode/lr': node_scheduler.get_last_lr()[0],
+                        'neural_ode/nfe': nfe,
+                        'neural_ode/train_horizon': current_horizon,
+                        'neural_ode/step': itr,
+                    })
 
-            log['Neural ODE']['iters_slow'].append(itr)
-            log['Neural ODE']['test_mse'].append(test_mse)
-            log['Neural ODE']['energy_viol'].append(ev)
-            log['Neural ODE']['div_time'].append(dt_val)
-            log['Neural ODE']['ftle_error'].append(ftle_err)
+                update_batch_plots('Neural ODE')
+                plt.pause(0.001)
 
-            print(f'    [eval] Test MSE {test_mse:.6f} | '
-                  f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s | '
-                  f'FTLE Error {ftle_err:.4f}')
+            if itr % args.eval_every == 0:
+                test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_node(node_func)
 
-            if use_wandb:
-                wandb.log({
-                    'neural_ode/test_mse': test_mse,
-                    'neural_ode/energy_violation': ev,
-                    'neural_ode/divergence_time': dt_val,
-                    'neural_ode/ftle_error': ftle_err,
-                    'neural_ode/step': itr,
-                })
+                log['Neural ODE']['iters_slow'].append(itr)
+                log['Neural ODE']['test_mse'].append(test_mse)
+                log['Neural ODE']['energy_viol'].append(ev)
+                log['Neural ODE']['div_time'].append(dt_val)
+                log['Neural ODE']['ftle_error'].append(ftle_err)
 
-            update_test_plots('Neural ODE')
-            update_traj_plot('Neural ODE', viz_pred)
-            plt.pause(0.001)
+                print(f'    [eval] Test MSE {test_mse:.6f} | '
+                      f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s | '
+                      f'FTLE Error {ftle_err:.4f}')
 
-        if itr % 1000 == 0:
-            ckpt_dir = os.path.join(model_dir, 'checkpoints')
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(node_func.state_dict(),
-                       os.path.join(ckpt_dir, f'neural_ode_iter{itr}.pt'))
-            print(f'    [checkpoint] Neural ODE saved at iter {itr}')
+                if use_wandb:
+                    wandb.log({
+                        'neural_ode/test_mse': test_mse,
+                        'neural_ode/energy_violation': ev,
+                        'neural_ode/divergence_time': dt_val,
+                        'neural_ode/ftle_error': ftle_err,
+                        'neural_ode/step': itr,
+                    })
 
-    train_time_node = time.time() - start
+                update_test_plots('Neural ODE')
+                update_traj_plot('Neural ODE', viz_pred)
+                plt.pause(0.001)
+
+            if itr % 1000 == 0:
+                ckpt_dir = os.path.join(model_dir, 'checkpoints')
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save(node_func.state_dict(),
+                           os.path.join(ckpt_dir, f'neural_ode_iter{itr}.pt'))
+                print(f'    [checkpoint] Neural ODE saved at iter {itr}')
+
+        train_time_node = time.time() - start
 
     # ==================================================================
     # Train sequence models (RNN, GRU, LSTM)
@@ -862,13 +973,19 @@ if __name__ == '__main__':
             rnn_input = batch_y[:-1]
             rnn_target = batch_y[1:]
             rnn_pred, _ = seq_model(rnn_input)
-            traj_loss = torch.mean((rnn_pred - rnn_target) ** 2)
+            if args.traj_weight > 0:
+                traj_loss = torch.mean((rnn_pred - rnn_target) ** 2)
+            else:
+                traj_loss = torch.tensor(0.0, device=device)
 
             # Energy conservation loss
-            pred_4d = sincos_to_angles(denormalize(rnn_pred))
-            E_pred = energy_fn(pred_4d, args)
-            E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)
-            energy_loss = torch.mean(torch.abs(E_pred - E0))
+            if args.energy_weight > 0:
+                pred_4d = sincos_to_angles(denormalize(rnn_pred))
+                E_pred = energy_fn(pred_4d, args)
+                E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)
+                energy_loss = torch.mean(torch.abs(E_pred - E0))
+            else:
+                energy_loss = torch.tensor(0.0, device=device)
 
             # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
             if itr <= args.energy_warmup:
@@ -878,7 +995,7 @@ if __name__ == '__main__':
             else:
                 ew = args.energy_weight
 
-            loss = traj_loss + ew * energy_loss
+            loss = args.traj_weight * traj_loss + ew * energy_loss
             loss.backward()
             clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -990,16 +1107,17 @@ if __name__ == '__main__':
     # Final trajectory plot with all models
     fig_final, axes_final = plt.subplots(n_viz, n_viz_cols,
                                          figsize=(4 * n_viz_cols, 3 * n_viz))
-    t_np = t.cpu().numpy()
+    t_np = t_viz.cpu().numpy()
     col_labels = list(state_labels) + (['Energy'] if has_energy else [])
 
     final_preds = {}
     with torch.no_grad():
-        final_preds['Neural ODE'] = sincos_to_angles(denormalize(
-            odeint(node_func, viz_y0_norm, t, **solver_kwargs)))
+        if train_node:
+            final_preds['Neural ODE'] = sincos_to_angles(denormalize(
+                odeint(node_func, viz_y0_norm, t_viz, **solver_kwargs)))
         for nm, sm in seq_models.items():
             final_preds[nm] = sincos_to_angles(denormalize(
-                sm.predict_trajectory(viz_y0_norm, n_time_points)))
+                sm.predict_trajectory(viz_y0_norm, n_viz_points)))
 
     for row in range(n_viz):
         true_np = viz_true[:, row, :].cpu().numpy()
@@ -1033,7 +1151,7 @@ if __name__ == '__main__':
                 ax_e.set_xlabel('t (s)')
             ax_e.legend(fontsize=5)
 
-    fig_final.suptitle(f'All Models — Fixed Trajectories ({args.traj_time}s)')
+    fig_final.suptitle(f'All Models — Fixed Trajectories ({viz_time}s)')
     fig_final.tight_layout()
     fig_final.savefig(f'{output_dir}/trajectory_final.png', dpi=150)
     print(f'Saved {output_dir}/trajectory_final.png')
