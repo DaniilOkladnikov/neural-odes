@@ -810,7 +810,19 @@ if __name__ == '__main__':
             batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
 
             node_func.nfe = 0
-            pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
+
+            # Optimization: Only solve ODE if required for loss or logging
+            need_solve_grad = (args.traj_weight > 0) or (args.energy_weight > 0) or (args.jac_weight > 0)
+            need_solve_log = (itr % args.log_every == 0)
+
+            if need_solve_grad:
+                pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
+            elif need_solve_log:
+                with torch.no_grad():
+                    pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
+            else:
+                pred_y = None
+
             nfe = node_func.nfe
 
             if args.traj_weight > 0:
