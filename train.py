@@ -5,6 +5,7 @@ import numpy as np
 
 import torch
 import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
@@ -18,6 +19,8 @@ except ImportError:
 from dynamics import get_system, SYSTEMS
 from models import (ODEFunc, SequencePredictor, RunningAverageMeter,
                     count_parameters, compute_default_hidden_sizes)
+
+print(torch.cuda.is_available())
 
 # ---------------------------------------------------------------------------
 # Two-stage CLI argument parsing
@@ -44,7 +47,7 @@ parser.add_argument('--step_size', type=float, default=0.005,
                     help='Step size for fixed-step solvers (euler, rk4)')
 parser.add_argument('--adjoint', action='store_true')
 # Dataset
-parser.add_argument('--n_trajectories', type=int, default=20000)
+parser.add_argument('--n_trajectories', type=int, default=50000)
 parser.add_argument('--traj_time', type=float, default=1.0,
                     help='Duration of each trajectory in seconds')
 parser.add_argument('--traj_dt', type=float, default=0.05,
@@ -56,21 +59,52 @@ parser.add_argument('--gen_batch_size', type=int, default=500,
                     help='Batch size for trajectory generation (memory)')
 # Training
 parser.add_argument('--batch_size', type=int, default=256)
-parser.add_argument('--niters', type=int, default=6000)
-parser.add_argument('--lr', type=float, default=2e-4)
+parser.add_argument('--niters', type=int, default=20000)
+parser.add_argument('--eta_max', type=float, default=3e-4,
+                    help='Initial / maximum learning rate')
+parser.add_argument('--eta_min', type=float, default=1e-5,
+                    help='Minimum learning rate for cosine annealing')
+parser.add_argument('--lr_restart_period', type=int, default=20000,
+                    help='Period for cosine annealing warm restarts (iterations)')
+parser.add_argument('--energy_weight', type=float, default=0.1)
+parser.add_argument('--energy_warmup', type=int, default=5000,
+                    help='Iterations before energy loss starts ramping up')
+parser.add_argument('--energy_rampup', type=int, default=5000,
+                    help='Iterations over which energy weight ramps from 0 to target')
+# Jacobian regularization (Neural ODE only)
+parser.add_argument('--jac_weight', type=float, default=0.01,
+                    help='Jacobian Frobenius norm penalty weight (0 to disable)')
+parser.add_argument('--jac_warmup', type=int, default=2000,
+                    help='Iterations before Jacobian loss starts ramping up')
+parser.add_argument('--jac_rampup', type=int, default=5000,
+                    help='Iterations over which Jacobian weight ramps from 0 to target')
+parser.add_argument('--jac_samples', type=int, default=256,
+                    help='Points subsampled from trajectory for Jacobian estimation')
+# Horizon curriculum
+parser.add_argument('--horizon_start_iter', type=int, default=5000,
+                    help='Iteration at which to start increasing training horizon')
+parser.add_argument('--horizon_rate', type=float, default=0.2,
+                    help='Horizon increase rate in seconds per 1000 iterations')
+parser.add_argument('--horizon_max', type=float, default=1.0,
+                    help='Maximum training horizon in seconds')
 # Monitoring
 parser.add_argument('--log_every', type=int, default=100)
 parser.add_argument('--eval_every', type=int, default=1000)
 parser.add_argument('--div_threshold', type=float, default=0.5,
                     help='Divergence threshold in radians')
+parser.add_argument('--n_lyap', type=int, default=100,
+                    help='Number of samples for FTLE Lyapunov computation')
+parser.add_argument('--lyap_delta', type=float, default=1e-5,
+                    help='Perturbation magnitude for FTLE computation')
 parser.add_argument('--no_wandb', action='store_true')
 # Model sizes
-H_node, H_rnn, H_gru, H_lstm = compute_default_hidden_sizes(repr_dim)
-parser.add_argument('--node_hidden', type=int, default=H_node)
-parser.add_argument('--rnn_hidden', type=int, default=H_rnn)
-parser.add_argument('--gru_hidden', type=int, default=H_gru)
-parser.add_argument('--lstm_hidden', type=int, default=H_lstm)
+parser.add_argument('--target_params', type=int, default=100000,
+                    help='Target parameter count for auto-computed hidden sizes')
 parser.add_argument('--num_layers', type=int, default=5)
+parser.add_argument('--node_hidden', type=int, default=None)
+parser.add_argument('--rnn_hidden', type=int, default=None)
+parser.add_argument('--gru_hidden', type=int, default=None)
+parser.add_argument('--lstm_hidden', type=int, default=None)
 # Output
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--seed', type=int, default=42)
@@ -78,6 +112,18 @@ parser.add_argument('--seed', type=int, default=42)
 system['add_cli_args'](parser)
 
 args = parser.parse_args()
+
+# Fill in hidden sizes that weren't explicitly set
+H_node, H_rnn, H_gru, H_lstm = compute_default_hidden_sizes(
+    repr_dim, args.num_layers, args.target_params)
+if args.node_hidden is None:
+    args.node_hidden = H_node
+if args.rnn_hidden is None:
+    args.rnn_hidden = H_rnn
+if args.gru_hidden is None:
+    args.gru_hidden = H_gru
+if args.lstm_hidden is None:
+    args.lstm_hidden = H_lstm
 
 if args.adjoint:
     from torchdiffeq import odeint_adjoint as odeint
@@ -154,8 +200,22 @@ dynamics = system['dynamics_fn'](args)
 if args.E_max is None:
     args.E_max = compute_E_max_fn(args.m1, args.m2, args.l1, args.l2, args.g)
 
+# Evaluation time vector (initial horizon)
 n_time_points = int(round(args.traj_time / args.traj_dt)) + 1
 t = torch.linspace(0., args.traj_time, n_time_points).to(device)
+
+# Compute max training horizon for data generation (horizon curriculum)
+if args.horizon_start_iter < args.niters:
+    iters_of_increase = args.niters - args.horizon_start_iter
+    max_train_horizon = min(
+        args.traj_time + args.horizon_rate * iters_of_increase / 1000,
+        args.horizon_max
+    )
+else:
+    max_train_horizon = args.traj_time
+gen_horizon = max(args.traj_time, max_train_horizon)
+n_gen_points = int(round(gen_horizon / args.traj_dt)) + 1
+t_gen = torch.linspace(0., gen_horizon, n_gen_points).to(device)
 
 print(f'Sampling {args.n_trajectories} initial conditions '
       f'with E in [0, {args.E_max:.2f}] ...')
@@ -165,12 +225,12 @@ all_y0 = sample_ics_fn(
 ).to(device)
 
 print(f'Integrating {args.n_trajectories} trajectories '
-      f'({n_time_points} steps, dt={args.traj_dt}s) ...')
+      f'({n_gen_points} steps, dt={args.traj_dt}s, horizon={gen_horizon:.1f}s) ...')
 all_trajectories = []
 for i in range(0, args.n_trajectories, args.gen_batch_size):
     batch_y0 = all_y0[i:i + args.gen_batch_size]
     with torch.no_grad():
-        batch_traj = odeint(dynamics, batch_y0, t, **solver_kwargs)
+        batch_traj = odeint(dynamics, batch_y0, t_gen, **solver_kwargs)
     all_trajectories.append(batch_traj)
     done = min(i + args.gen_batch_size, args.n_trajectories)
     if done % 2000 == 0 or done == args.n_trajectories:
@@ -216,13 +276,37 @@ def denormalize(y):
     return y * y_std + y_mean
 
 
-def get_batch():
+def get_batch(n_points=None):
+    if n_points is None:
+        n_points = n_time_points
     idx = np.random.choice(n_train, args.batch_size, replace=False)
     batch_y0 = train_y0_norm[idx]
-    batch_t = t
-    batch_y = train_traj_norm[:, idx, :]
+    batch_t = t_gen[:n_points]
+    batch_y = train_traj_norm[:n_points, idx, :]
     batch_y0_phys = train_y0_phys[idx]
     return batch_y0, batch_t, batch_y, batch_y0_phys
+
+
+# ---------------------------------------------------------------------------
+# Jacobian regularization (Lipschitz continuity)
+# ---------------------------------------------------------------------------
+def compute_jac_reg(func_net, pred_y, n_samples=256):
+    """Estimate mean ||df/dy||_F^2 via Hutchinson's stochastic trace estimator.
+
+    Detaches trajectory points from the ODE solver graph and re-forwards
+    through the network to build a fresh autograd graph for the VJP.
+    """
+    T, B, D = pred_y.shape
+    flat_y = pred_y.detach().reshape(-1, D)
+    n_total = flat_y.shape[0]
+    n_samples = min(n_samples, n_total)
+    idx = torch.randperm(n_total, device=flat_y.device)[:n_samples]
+    y = flat_y[idx].requires_grad_(True)
+
+    f = func_net(y)                               # (n_samples, D)
+    v = torch.randn_like(f)                        # random projection
+    vjp, = torch.autograd.grad(f, y, v, create_graph=True)
+    return torch.mean(vjp ** 2)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +335,26 @@ def compute_divergence_time(pred, true, t_array, threshold):
     div_t = t_array[first_idx]
     div_t[never] = t_array[-1]
     return div_t.mean().item()
+
+
+def compute_ftle(y_final, y_pert_final, delta_norms, T):
+    """Finite-Time Lyapunov Exponent for each sample.
+
+    Args:
+        y_final:       (N, state_dim) final state of original trajectories
+        y_pert_final:  (N, state_dim) final state of perturbed trajectories
+        delta_norms:   (N,) ||delta_0|| for each sample
+        T:             float, integration time
+    Returns:
+        ftle: (N,) tensor of FTLE values
+    """
+    diff = y_pert_final - y_final
+    # Wrap angle dimensions to [-pi, pi] to avoid 2pi jumps
+    for idx in angle_indices:
+        diff[..., idx] = torch.atan2(torch.sin(diff[..., idx]), torch.cos(diff[..., idx]))
+    separation = torch.norm(diff, dim=-1)           # (N,)
+    ratio = separation / delta_norms.clamp(min=1e-30)
+    return (1.0 / T) * torch.log(ratio.clamp(min=1e-30))  # (N,)
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +396,12 @@ if __name__ == '__main__':
     n_eval = min(1000, n_test)
     eval_perm = torch.randperm(n_test)
     eval_idx = eval_perm[:n_eval]
-    eval_traj_norm = test_traj_norm[:, eval_idx, :]  # (T, n_eval, repr_dim) — normalized 6D
+    eval_traj_norm = test_traj_norm[:n_time_points, eval_idx, :]  # (T_init, n_eval, repr_dim) — normalized 6D
     eval_y0_phys = test_y0_phys[eval_idx]            # (n_eval, state_dim) — 4D for energy
     eval_y0_norm = test_y0_norm[eval_idx]
 
-    # Divergence time: 50 fixed samples, 10s simulation
-    n_div = min(50, n_eval)
+    # Divergence time: full eval set, 10s simulation
+    n_div = n_eval
     div_idx = eval_idx[:n_div]
     div_y0_phys = test_y0_phys[div_idx]           # 4D for odeint with physical dynamics
     div_y0_norm = test_y0_norm[div_idx]
@@ -305,16 +409,64 @@ if __name__ == '__main__':
     n_long = len(t_long)
 
     print(f'Pre-computing 10s ground truth for {n_div} divergence-time samples ...')
+    div_true_chunks = []
     with torch.no_grad():
-        div_true = odeint(dynamics, div_y0_phys, t_long, **solver_kwargs)  # 4D
-        div_true[..., 0] = torch.atan2(torch.sin(div_true[..., 0]), torch.cos(div_true[..., 0]))
-        div_true[..., 1] = torch.atan2(torch.sin(div_true[..., 1]), torch.cos(div_true[..., 1]))
+        for i in range(0, n_div, args.gen_batch_size):
+            chunk = odeint(dynamics, div_y0_phys[i:i + args.gen_batch_size],
+                           t_long, **solver_kwargs)
+            chunk[..., 0] = torch.atan2(torch.sin(chunk[..., 0]), torch.cos(chunk[..., 0]))
+            chunk[..., 1] = torch.atan2(torch.sin(chunk[..., 1]), torch.cos(chunk[..., 1]))
+            div_true_chunks.append(chunk)
+            print(f'  {min(i + args.gen_batch_size, n_div)}/{n_div}')
+        div_true = torch.cat(div_true_chunks, dim=1)  # (T_long, n_div, 4)
 
-    # Trajectory viz: 1 fixed IC, 10s
-    viz_y0_phys = test_y0_phys[0:1]               # 4D for odeint
-    viz_y0_norm = test_y0_norm[0:1]
+    # FTLE (Lyapunov) pre-computation
+    n_lyap = min(args.n_lyap, n_eval)
+    lyap_idx = eval_idx[:n_lyap]
+    lyap_y0_phys = test_y0_phys[lyap_idx]              # (n_lyap, 4)
+    lyap_y0_norm = test_y0_norm[lyap_idx]              # (n_lyap, 6)
+
+    # Random perturbation directions in 4D physical space
+    lyap_gen = torch.Generator(device=device).manual_seed(args.seed + 999)
+    lyap_directions = torch.randn(n_lyap, state_dim, device=device, generator=lyap_gen)
+    lyap_directions = lyap_directions / torch.norm(lyap_directions, dim=-1, keepdim=True)
+    lyap_delta_vecs = args.lyap_delta * lyap_directions       # (n_lyap, 4)
+    lyap_delta_norms = torch.norm(lyap_delta_vecs, dim=-1)    # (n_lyap,)
+
+    # Perturbed ICs → normalized sin/cos representation
+    lyap_y0_pert_phys = lyap_y0_phys + lyap_delta_vecs        # (n_lyap, 4)
+    lyap_y0_pert_sincos = angles_to_sincos(lyap_y0_pert_phys) # (n_lyap, 6)
+    lyap_y0_pert_norm = (lyap_y0_pert_sincos - y_mean.squeeze(0)) / y_std.squeeze(0)
+
+    T_lyap = t[-1].item()  # args.traj_time
+
+    print(f'Pre-computing true FTLE for {n_lyap} samples ...')
     with torch.no_grad():
-        viz_true = odeint(dynamics, viz_y0_phys, t_long, **solver_kwargs)  # (T_long, 1, 4)
+        lyap_true_orig_chunks = []
+        for i in range(0, n_lyap, args.gen_batch_size):
+            chunk = odeint(dynamics, lyap_y0_phys[i:i + args.gen_batch_size],
+                           t, **solver_kwargs)
+            lyap_true_orig_chunks.append(chunk[-1])            # final time: (B, 4)
+        lyap_true_orig_final = torch.cat(lyap_true_orig_chunks, dim=0)
+
+        lyap_true_pert_chunks = []
+        for i in range(0, n_lyap, args.gen_batch_size):
+            chunk = odeint(dynamics, lyap_y0_pert_phys[i:i + args.gen_batch_size],
+                           t, **solver_kwargs)
+            lyap_true_pert_chunks.append(chunk[-1])
+        lyap_true_pert_final = torch.cat(lyap_true_pert_chunks, dim=0)
+
+        true_ftle = compute_ftle(lyap_true_orig_final, lyap_true_pert_final,
+                                 lyap_delta_norms, T_lyap)
+        print(f'  True FTLE: mean={true_ftle.mean().item():.4f}, '
+              f'std={true_ftle.std().item():.4f}')
+
+    # Trajectory viz: 3 fixed ICs
+    n_viz = 3
+    viz_y0_phys = test_y0_phys[0:n_viz]           # (3, 4)
+    viz_y0_norm = test_y0_norm[0:n_viz]            # (3, 6)
+    with torch.no_grad():
+        viz_true = odeint(dynamics, viz_y0_phys, t, **solver_kwargs)  # (T_viz, 3, 4)
         viz_true[..., 0] = torch.atan2(torch.sin(viz_true[..., 0]), torch.cos(viz_true[..., 0]))
         viz_true[..., 1] = torch.atan2(torch.sin(viz_true[..., 1]), torch.cos(viz_true[..., 1]))
 
@@ -325,6 +477,7 @@ if __name__ == '__main__':
     if use_wandb:
         wandb.init(project='neural-odes-dp', config=vars(args))
         for prefix in ['neural_ode', 'rnn', 'gru', 'lstm']:
+            wandb.define_metric(f'{prefix}/step')
             wandb.define_metric(f'{prefix}/*', step_metric=f'{prefix}/step')
     elif not args.no_wandb:
         print('Warning: wandb not installed, logging disabled')
@@ -339,14 +492,16 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     plt.ion()
     fig_batch, (ax_bmse, ax_nfe) = plt.subplots(1, 2, figsize=(12, 4))
-    fig_test, (ax_tmse, ax_ev, ax_dt) = plt.subplots(1, 3, figsize=(16, 4))
+    fig_test, (ax_tmse, ax_ev, ax_dt, ax_ftle) = plt.subplots(1, 4, figsize=(20, 4))
     state_labels = system['state_labels']
-    fig_traj, axes_traj = plt.subplots(2, 3, figsize=(16, 8))
-    fig_traj.suptitle('Fixed Trajectory (10s)')
+    n_viz_cols = state_dim + (1 if has_energy else 0)  # 4 state vars + energy
+    fig_traj, axes_traj = plt.subplots(n_viz, n_viz_cols, figsize=(4 * n_viz_cols, 3 * n_viz))
+    fig_traj.suptitle(f'Fixed Trajectories ({args.traj_time}s)')
 
     log = {name: {
         'iters_fast': [], 'batch_mse': [], 'nfe': [],
         'iters_slow': [], 'test_mse': [], 'energy_viol': [], 'div_time': [],
+        'ftle_error': [],
     } for name in names}
 
     def update_batch_plots(model_name):
@@ -382,6 +537,7 @@ if __name__ == '__main__':
             (ax_tmse, 'test_mse', 'Test MSE', 'log'),
             (ax_ev, 'energy_viol', 'Energy Violation', 'log'),
             (ax_dt, 'div_time', 'Mean Divergence Time (s)', 'linear'),
+            (ax_ftle, 'ftle_error', 'FTLE Error', 'log'),
         ]:
             ax.cla()
             ax.set_title(title)
@@ -400,46 +556,58 @@ if __name__ == '__main__':
         fig_test.canvas.flush_events()
 
     def update_traj_plot(model_name, viz_pred):
-        """Update the fixed trajectory figure for the currently training model."""
-        t_np = t_long.cpu().numpy()
-        true_np = viz_true[:, 0, :].cpu().numpy()
-        pred_np = viz_pred[:, 0, :].cpu().numpy()
+        """Update the fixed trajectory figure (3 trajectories x 5 columns)."""
+        t_np = t.cpu().numpy()
+        col_labels = list(state_labels) + (['Energy'] if has_energy else [])
 
         for ax in axes_traj.flat:
             ax.cla()
 
-        for i in range(4):
-            ax = axes_traj.flat[i]
-            ax.plot(t_np, true_np[:, i], 'k-', lw=1.5, label='True')
-            ax.plot(t_np, pred_np[:, i], '--', color=colors[model_name],
-                    lw=1.2, label=model_name)
-            ax.set_ylabel(state_labels[i])
-            ax.legend(fontsize=7)
-            if i >= 2:
-                ax.set_xlabel('t (s)')
+        for row in range(n_viz):
+            true_np = viz_true[:, row, :].cpu().numpy()
+            pred_np = viz_pred[:, row, :].cpu().numpy()
 
-        if has_energy:
-            ax_e = axes_traj.flat[4]
-            E_true = energy_fn(viz_true, args)[:, 0].cpu().numpy()
-            E_pred = energy_fn(viz_pred, args)[:, 0].cpu().numpy()
-            ax_e.plot(t_np, E_true, 'k-', lw=1.5, label='True')
-            ax_e.plot(t_np, E_pred, '--', color=colors[model_name],
-                      lw=1.2, label=model_name)
-            ax_e.set_ylabel('Energy')
-            ax_e.set_xlabel('t (s)')
-            ax_e.legend(fontsize=7)
+            for col in range(state_dim):
+                ax = axes_traj[row, col]
+                ax.plot(t_np, true_np[:, col], 'k-', lw=1.5, label='True')
+                ax.plot(t_np, pred_np[:, col], '--', color=colors[model_name],
+                        lw=1.2, label=model_name)
+                if row == 0:
+                    ax.set_title(col_labels[col])
+                if row == n_viz - 1:
+                    ax.set_xlabel('t (s)')
+                if col == 0:
+                    ax.set_ylabel(f'Traj {row + 1}')
+                ax.legend(fontsize=6)
 
-        axes_traj.flat[5].axis('off')
-        fig_traj.suptitle(f'Fixed Trajectory — {model_name}')
+            if has_energy:
+                ax_e = axes_traj[row, state_dim]
+                E_true = energy_fn(viz_true[:, row:row + 1, :], args)[:, 0].cpu().numpy()
+                E_pred = energy_fn(viz_pred[:, row:row + 1, :], args)[:, 0].cpu().numpy()
+                ax_e.plot(t_np, E_true, 'k-', lw=1.5, label='True')
+                ax_e.plot(t_np, E_pred, '--', color=colors[model_name],
+                          lw=1.2, label=model_name)
+                if row == 0:
+                    ax_e.set_title('Energy')
+                if row == n_viz - 1:
+                    ax_e.set_xlabel('t (s)')
+                ax_e.legend(fontsize=6)
+
+        fig_traj.suptitle(f'Fixed Trajectories — {model_name}')
         fig_traj.tight_layout()
         fig_traj.canvas.draw_idle()
         fig_traj.canvas.flush_events()
+
+        if use_wandb:
+            prefix = wb_prefix[model_name]
+            wandb.log({f'{prefix}/trajectory_plot': wandb.Image(fig_traj),
+                       f'{prefix}/step': log[model_name]['iters_slow'][-1]})
 
     # ------------------------------------------------------------------
     # Helper: full evaluation on test set
     # ------------------------------------------------------------------
     def evaluate_node(func):
-        """Evaluate Neural ODE on fixed eval sets. Returns test_mse, energy_viol, div_time, viz_pred_4d."""
+        """Evaluate Neural ODE on fixed eval sets."""
         with torch.no_grad():
             # Test MSE in normalized space (same scale as batch MSE)
             chunks = []
@@ -453,14 +621,38 @@ if __name__ == '__main__':
             eval_pred_4d = sincos_to_angles(denormalize(eval_pred_norm))
             ev = compute_energy_violation(eval_pred_4d, eval_y0_phys, energy_fn, args) if has_energy else 0.0
 
-            # Divergence time (10s) — convert to 4D for angle comparison
-            div_pred = sincos_to_angles(denormalize(odeint(func, div_y0_norm, t_long, **solver_kwargs)))
+            # Divergence time (10s) — batched
+            div_pred_chunks = []
+            for i in range(0, n_div, args.gen_batch_size):
+                c = div_y0_norm[i:i + args.gen_batch_size]
+                div_pred_chunks.append(sincos_to_angles(denormalize(
+                    odeint(func, c, t_long, **solver_kwargs))))
+            div_pred = torch.cat(div_pred_chunks, dim=1)
             dt_val = compute_divergence_time(div_pred, div_true, t_long, args.div_threshold)
 
-            # Trajectory viz (10s) — return 4D for plotting
-            viz_pred_4d = sincos_to_angles(denormalize(odeint(func, viz_y0_norm, t_long, **solver_kwargs)))
+            # FTLE (Lyapunov) error
+            lyap_orig_chunks = []
+            for i in range(0, n_lyap, args.gen_batch_size):
+                c = lyap_y0_norm[i:i + args.gen_batch_size]
+                chunk = odeint(func, c, t, **solver_kwargs)
+                lyap_orig_chunks.append(sincos_to_angles(denormalize(chunk)[-1]))
+            lyap_pred_orig_final = torch.cat(lyap_orig_chunks, dim=0)
 
-        return test_mse, ev, dt_val, viz_pred_4d
+            lyap_pert_chunks = []
+            for i in range(0, n_lyap, args.gen_batch_size):
+                c = lyap_y0_pert_norm[i:i + args.gen_batch_size]
+                chunk = odeint(func, c, t, **solver_kwargs)
+                lyap_pert_chunks.append(sincos_to_angles(denormalize(chunk)[-1]))
+            lyap_pred_pert_final = torch.cat(lyap_pert_chunks, dim=0)
+
+            pred_ftle = compute_ftle(lyap_pred_orig_final, lyap_pred_pert_final,
+                                     lyap_delta_norms, T_lyap)
+            ftle_err = torch.mean(torch.abs(pred_ftle - true_ftle)).item()
+
+            # Trajectory viz — return 4D for plotting
+            viz_pred_4d = sincos_to_angles(denormalize(odeint(func, viz_y0_norm, t, **solver_kwargs)))
+
+        return test_mse, ev, dt_val, ftle_err, viz_pred_4d
 
     def evaluate_seq(model):
         """Evaluate sequence model on fixed eval sets."""
@@ -475,29 +667,69 @@ if __name__ == '__main__':
             eval_pred_4d = sincos_to_angles(denormalize(eval_pred_norm))
             ev = compute_energy_violation(eval_pred_4d, eval_y0_phys, energy_fn, args) if has_energy else 0.0
 
-            div_pred = sincos_to_angles(denormalize(model.predict_trajectory(div_y0_norm, n_long)))
+            # Divergence time (10s) — batched
+            div_pred_chunks = []
+            for i in range(0, n_div, args.gen_batch_size):
+                c = div_y0_norm[i:i + args.gen_batch_size]
+                div_pred_chunks.append(sincos_to_angles(denormalize(
+                    model.predict_trajectory(c, n_long))))
+            div_pred = torch.cat(div_pred_chunks, dim=1)
             dt_val = compute_divergence_time(div_pred, div_true, t_long, args.div_threshold)
 
-            viz_pred_4d = sincos_to_angles(denormalize(model.predict_trajectory(viz_y0_norm, n_long)))
+            # FTLE (Lyapunov) error
+            lyap_orig_chunks = []
+            for i in range(0, n_lyap, args.gen_batch_size):
+                c = lyap_y0_norm[i:i + args.gen_batch_size]
+                pred = model.predict_trajectory(c, n_time_points)
+                lyap_orig_chunks.append(sincos_to_angles(denormalize(pred)[-1]))
+            lyap_pred_orig_final = torch.cat(lyap_orig_chunks, dim=0)
 
-        return test_mse, ev, dt_val, viz_pred_4d
+            lyap_pert_chunks = []
+            for i in range(0, n_lyap, args.gen_batch_size):
+                c = lyap_y0_pert_norm[i:i + args.gen_batch_size]
+                pred = model.predict_trajectory(c, n_time_points)
+                lyap_pert_chunks.append(sincos_to_angles(denormalize(pred)[-1]))
+            lyap_pred_pert_final = torch.cat(lyap_pert_chunks, dim=0)
+
+            pred_ftle = compute_ftle(lyap_pred_orig_final, lyap_pred_pert_final,
+                                     lyap_delta_norms, T_lyap)
+            ftle_err = torch.mean(torch.abs(pred_ftle - true_ftle)).item()
+
+            viz_pred_4d = sincos_to_angles(denormalize(model.predict_trajectory(viz_y0_norm, n_time_points)))
+
+        return test_mse, ev, dt_val, ftle_err, viz_pred_4d
 
     # ==================================================================
     # Train Neural ODE
     # ==================================================================
     print('\n=== Training Neural ODE ===')
-    node_optimizer = optim.Adam(node_func.parameters(), lr=args.lr)
+    node_optimizer = optim.Adam(node_func.parameters(), lr=args.eta_max,
+                                weight_decay=1e-4)
+    node_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        node_optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
+    )
     start = time.time()
 
     for itr in range(1, args.niters + 1):
         node_optimizer.zero_grad()
-        batch_y0, batch_t, batch_y, batch_y0_phys = get_batch()
+
+        # Horizon curriculum
+        if itr < args.horizon_start_iter:
+            current_horizon = args.traj_time
+        else:
+            current_horizon = min(
+                args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
+                args.horizon_max
+            )
+        n_current_points = int(round(current_horizon / args.traj_dt)) + 1
+
+        batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
 
         node_func.nfe = 0
         pred_y = odeint(node_func, batch_y0, batch_t, **solver_kwargs).to(device)
         nfe = node_func.nfe
 
-        traj_loss = torch.mean(torch.abs(pred_y - batch_y))
+        traj_loss = torch.mean((pred_y - batch_y) ** 2)
 
         # Energy conservation loss
         pred_4d = sincos_to_angles(denormalize(pred_y))
@@ -505,9 +737,34 @@ if __name__ == '__main__':
         E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)    # (1, batch)
         energy_loss = torch.mean(torch.abs(E_pred - E0))
 
-        loss = traj_loss + 0.2 * energy_loss
+        # Jacobian regularization (Lipschitz continuity)
+        if args.jac_weight > 0:
+            jac_loss = compute_jac_reg(node_func.net, pred_y,
+                                       n_samples=args.jac_samples)
+        else:
+            jac_loss = torch.tensor(0.0, device=device)
+
+        # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
+        if itr <= args.energy_warmup:
+            ew = 0.0
+        elif itr <= args.energy_warmup + args.energy_rampup:
+            ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
+        else:
+            ew = args.energy_weight
+
+        # Jacobian weight curriculum
+        if itr <= args.jac_warmup:
+            jw = 0.0
+        elif itr <= args.jac_warmup + args.jac_rampup:
+            jw = args.jac_weight * (itr - args.jac_warmup) / args.jac_rampup
+        else:
+            jw = args.jac_weight
+
+        loss = traj_loss + ew * energy_loss + jw * jac_loss
         loss.backward()
+        clip_grad_norm_(node_func.parameters(), max_norm=1.0)
         node_optimizer.step()
+        node_scheduler.step()
 
         if itr % args.log_every == 0:
             with torch.no_grad():
@@ -518,13 +775,20 @@ if __name__ == '__main__':
             log['Neural ODE']['nfe'].append(nfe)
 
             print(f'  Iter {itr:5d} | MSE {batch_mse:.6f} | '
-                  f'E_loss {energy_loss.item():.4f} | NFE {nfe}')
+                  f'E_loss {energy_loss.item():.4f} | ew {ew:.4f} | '
+                  f'J_loss {jac_loss.item():.4f} | jw {jw:.4f} | '
+                  f'NFE {nfe} | horizon {current_horizon:.2f}s')
 
             if use_wandb:
                 wandb.log({
                     'neural_ode/batch_mse': batch_mse,
                     'neural_ode/energy_loss': energy_loss.item(),
+                    'neural_ode/energy_weight': ew,
+                    'neural_ode/jac_loss': jac_loss.item(),
+                    'neural_ode/jac_weight': jw,
+                    'neural_ode/lr': node_scheduler.get_last_lr()[0],
                     'neural_ode/nfe': nfe,
+                    'neural_ode/train_horizon': current_horizon,
                     'neural_ode/step': itr,
                 })
 
@@ -532,21 +796,24 @@ if __name__ == '__main__':
             plt.pause(0.001)
 
         if itr % args.eval_every == 0:
-            test_mse, ev, dt_val, viz_pred = evaluate_node(node_func)
+            test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_node(node_func)
 
             log['Neural ODE']['iters_slow'].append(itr)
             log['Neural ODE']['test_mse'].append(test_mse)
             log['Neural ODE']['energy_viol'].append(ev)
             log['Neural ODE']['div_time'].append(dt_val)
+            log['Neural ODE']['ftle_error'].append(ftle_err)
 
             print(f'    [eval] Test MSE {test_mse:.6f} | '
-                  f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s')
+                  f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s | '
+                  f'FTLE Error {ftle_err:.4f}')
 
             if use_wandb:
                 wandb.log({
                     'neural_ode/test_mse': test_mse,
                     'neural_ode/energy_violation': ev,
                     'neural_ode/divergence_time': dt_val,
+                    'neural_ode/ftle_error': ftle_err,
                     'neural_ode/step': itr,
                 })
 
@@ -570,17 +837,32 @@ if __name__ == '__main__':
 
     for model_name, seq_model in seq_models.items():
         print(f'\n=== Training {model_name} ===')
-        optimizer = optim.Adam(seq_model.parameters(), lr=args.lr)
+        optimizer = optim.Adam(seq_model.parameters(), lr=args.eta_max,
+                               weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
+        )
         start = time.time()
         prefix = wb_prefix[model_name]
 
         for itr in range(1, args.niters + 1):
             optimizer.zero_grad()
-            batch_y0, batch_t, batch_y, batch_y0_phys = get_batch()
+
+            # Horizon curriculum
+            if itr < args.horizon_start_iter:
+                current_horizon = args.traj_time
+            else:
+                current_horizon = min(
+                    args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
+                    args.horizon_max
+                )
+            n_current_points = int(round(current_horizon / args.traj_dt)) + 1
+
+            batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
             rnn_input = batch_y[:-1]
             rnn_target = batch_y[1:]
             rnn_pred, _ = seq_model(rnn_input)
-            traj_loss = torch.mean(torch.abs(rnn_pred - rnn_target))
+            traj_loss = torch.mean((rnn_pred - rnn_target) ** 2)
 
             # Energy conservation loss
             pred_4d = sincos_to_angles(denormalize(rnn_pred))
@@ -588,9 +870,19 @@ if __name__ == '__main__':
             E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)
             energy_loss = torch.mean(torch.abs(E_pred - E0))
 
-            loss = traj_loss + 0.2 * energy_loss
+            # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
+            if itr <= args.energy_warmup:
+                ew = 0.0
+            elif itr <= args.energy_warmup + args.energy_rampup:
+                ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
+            else:
+                ew = args.energy_weight
+
+            loss = traj_loss + ew * energy_loss
             loss.backward()
+            clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             if itr % args.log_every == 0:
                 with torch.no_grad():
@@ -600,12 +892,16 @@ if __name__ == '__main__':
                 log[model_name]['batch_mse'].append(batch_mse)
 
                 print(f'  Iter {itr:5d} | MSE {batch_mse:.6f} | '
-                      f'E_loss {energy_loss.item():.4f}')
+                      f'E_loss {energy_loss.item():.4f} | ew {ew:.4f} | '
+                      f'horizon {current_horizon:.2f}s')
 
                 if use_wandb:
                     wandb.log({
                         f'{prefix}/batch_mse': batch_mse,
                         f'{prefix}/energy_loss': energy_loss.item(),
+                        f'{prefix}/energy_weight': ew,
+                        f'{prefix}/lr': scheduler.get_last_lr()[0],
+                        f'{prefix}/train_horizon': current_horizon,
                         f'{prefix}/step': itr,
                     })
 
@@ -613,21 +909,24 @@ if __name__ == '__main__':
                 plt.pause(0.001)
 
             if itr % args.eval_every == 0:
-                test_mse, ev, dt_val, viz_pred = evaluate_seq(seq_model)
+                test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_seq(seq_model)
 
                 log[model_name]['iters_slow'].append(itr)
                 log[model_name]['test_mse'].append(test_mse)
                 log[model_name]['energy_viol'].append(ev)
                 log[model_name]['div_time'].append(dt_val)
+                log[model_name]['ftle_error'].append(ftle_err)
 
                 print(f'    [eval] Test MSE {test_mse:.6f} | '
-                      f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s')
+                      f'Energy Viol {ev:.4f} | Div Time {dt_val:.3f}s | '
+                      f'FTLE Error {ftle_err:.4f}')
 
                 if use_wandb:
                     wandb.log({
                         f'{prefix}/test_mse': test_mse,
                         f'{prefix}/energy_violation': ev,
                         f'{prefix}/divergence_time': dt_val,
+                        f'{prefix}/ftle_error': ftle_err,
                         f'{prefix}/step': itr,
                     })
 
@@ -678,7 +977,8 @@ if __name__ == '__main__':
             print(f'  {nm:12s} final — '
                   f'Test MSE: {d["test_mse"][-1]:.6f}  '
                   f'Energy Viol: {d["energy_viol"][-1]:.4f}  '
-                  f'Div Time: {d["div_time"][-1]:.3f}s')
+                  f'Div Time: {d["div_time"][-1]:.3f}s  '
+                  f'FTLE Error: {d["ftle_error"][-1]:.4f}')
     print('=' * 72)
 
     # Save monitoring figures
@@ -687,50 +987,59 @@ if __name__ == '__main__':
     print(f'Saved {output_dir}/training_monitor.png')
     print(f'Saved {output_dir}/test_evaluation.png')
 
-    # Final trajectory plot with all models (local only)
-    fig_final, axes_final = plt.subplots(2, 3, figsize=(16, 8))
-    t_np = t_long.cpu().numpy()
-    true_np = viz_true[:, 0, :].cpu().numpy()
+    # Final trajectory plot with all models
+    fig_final, axes_final = plt.subplots(n_viz, n_viz_cols,
+                                         figsize=(4 * n_viz_cols, 3 * n_viz))
+    t_np = t.cpu().numpy()
+    col_labels = list(state_labels) + (['Energy'] if has_energy else [])
 
     final_preds = {}
     with torch.no_grad():
         final_preds['Neural ODE'] = sincos_to_angles(denormalize(
-            odeint(node_func, viz_y0_norm, t_long, **solver_kwargs)))
+            odeint(node_func, viz_y0_norm, t, **solver_kwargs)))
         for nm, sm in seq_models.items():
             final_preds[nm] = sincos_to_angles(denormalize(
-                sm.predict_trajectory(viz_y0_norm, n_long)))
+                sm.predict_trajectory(viz_y0_norm, n_time_points)))
 
-    for i in range(4):
-        ax = axes_final.flat[i]
-        ax.plot(t_np, true_np[:, i], 'k-', lw=1.5, label='True')
-        for nm in names:
-            pred_np = final_preds[nm][:, 0, :].cpu().numpy()
-            ax.plot(t_np, pred_np[:, i], '--', color=colors[nm],
-                    lw=1, label=nm, alpha=0.8)
-        ax.set_ylabel(state_labels[i])
-        ax.legend(fontsize=6)
-        if i >= 2:
-            ax.set_xlabel('t (s)')
+    for row in range(n_viz):
+        true_np = viz_true[:, row, :].cpu().numpy()
 
-    if has_energy:
-        ax_e = axes_final.flat[4]
-        E_true = energy_fn(viz_true, args)[:, 0].cpu().numpy()
-        ax_e.plot(t_np, E_true, 'k-', lw=1.5, label='True')
-        for nm in names:
-            E_p = energy_fn(final_preds[nm], args)[:, 0].cpu().numpy()
-            ax_e.plot(t_np, E_p, '--', color=colors[nm], lw=1,
-                      label=nm, alpha=0.8)
-        ax_e.set_ylabel('Energy')
-        ax_e.set_xlabel('t (s)')
-        ax_e.legend(fontsize=6)
+        for col in range(state_dim):
+            ax = axes_final[row, col]
+            ax.plot(t_np, true_np[:, col], 'k-', lw=1.5, label='True')
+            for nm in names:
+                pred_np = final_preds[nm][:, row, :].cpu().numpy()
+                ax.plot(t_np, pred_np[:, col], '--', color=colors[nm],
+                        lw=1, label=nm, alpha=0.8)
+            if row == 0:
+                ax.set_title(col_labels[col])
+            if row == n_viz - 1:
+                ax.set_xlabel('t (s)')
+            if col == 0:
+                ax.set_ylabel(f'Traj {row + 1}')
+            ax.legend(fontsize=5)
 
-    axes_final.flat[5].axis('off')
-    fig_final.suptitle('All Models — Fixed Trajectory (10s)')
+        if has_energy:
+            ax_e = axes_final[row, state_dim]
+            E_true = energy_fn(viz_true[:, row:row + 1, :], args)[:, 0].cpu().numpy()
+            ax_e.plot(t_np, E_true, 'k-', lw=1.5, label='True')
+            for nm in names:
+                E_p = energy_fn(final_preds[nm][:, row:row + 1, :], args)[:, 0].cpu().numpy()
+                ax_e.plot(t_np, E_p, '--', color=colors[nm], lw=1,
+                          label=nm, alpha=0.8)
+            if row == 0:
+                ax_e.set_title('Energy')
+            if row == n_viz - 1:
+                ax_e.set_xlabel('t (s)')
+            ax_e.legend(fontsize=5)
+
+    fig_final.suptitle(f'All Models — Fixed Trajectories ({args.traj_time}s)')
     fig_final.tight_layout()
     fig_final.savefig(f'{output_dir}/trajectory_final.png', dpi=150)
     print(f'Saved {output_dir}/trajectory_final.png')
 
     if use_wandb:
+        wandb.log({'final/trajectory_plot': wandb.Image(fig_final)})
         wandb.finish()
 
     plt.ioff()
