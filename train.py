@@ -7,7 +7,10 @@ import torch
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except ImportError:
+    pass
 import matplotlib.pyplot as plt
 
 try:
@@ -19,8 +22,6 @@ except ImportError:
 from dynamics import get_system, SYSTEMS
 from models import (ODEFunc, SequencePredictor, RunningAverageMeter,
                     count_parameters, compute_default_hidden_sizes)
-
-print(torch.cuda.is_available())
 
 # ---------------------------------------------------------------------------
 # Two-stage CLI argument parsing
@@ -122,6 +123,12 @@ parser.add_argument('--gru_hidden', type=int, default=None)
 parser.add_argument('--lstm_hidden', type=int, default=None)
 # Output
 parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--resume_iter', type=int, default=0,
+                    help='Iteration to resume training from')
+parser.add_argument('--constant_lr', action='store_true',
+                    help='Use constant learning rate instead of cosine annealing')
+parser.add_argument('--wandb_id', type=str, default=None,
+                    help='Wandb run ID to resume (e.g. golden-haze-28)')
 parser.add_argument('--seed', type=int, default=42)
 # System-specific args
 system['add_cli_args'](parser)
@@ -561,7 +568,11 @@ if __name__ == '__main__':
     }
     use_wandb = HAS_WANDB and not args.no_wandb
     if use_wandb:
-        wandb.init(project='neural-odes-dp', config=vars(args))
+        wandb_kwargs = dict(project='neural-odes-dp', config=vars(args))
+        if args.wandb_id:
+            wandb_kwargs['id'] = args.wandb_id
+            wandb_kwargs['resume'] = 'must'
+        wandb.init(**wandb_kwargs)
         for name in names:
             prefix = wb_prefix[name]
             wandb.define_metric(f'{prefix}/step')
@@ -789,20 +800,33 @@ if __name__ == '__main__':
         print('\n=== Training Neural ODE ===')
         node_optimizer = optim.Adam(node_func.parameters(), lr=args.eta_max,
                                 weight_decay=1e-4)
-        node_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            node_optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
-        )
+        
+        if args.resume_iter > 0:
+            ckpt_path = os.path.join(model_dir, 'checkpoints', f'neural_ode_iter{args.resume_iter}.pt')
+            if os.path.exists(ckpt_path):
+                print(f'Loading checkpoint: {ckpt_path}')
+                node_func.load_state_dict(torch.load(ckpt_path, map_location=device))
+            else:
+                print(f'Warning: Checkpoint {ckpt_path} not found')
+
+        if args.constant_lr:
+            node_scheduler = None
+        else:
+            node_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                node_optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
+            )
         start = time.time()
 
-        for itr in range(1, args.niters + 1):
+        for itr in range(args.resume_iter + 1, args.resume_iter + args.niters + 1):
             node_optimizer.zero_grad()
+            rel_itr = itr - args.resume_iter
 
             # Horizon curriculum
-            if itr < args.horizon_start_iter:
+            if rel_itr < args.horizon_start_iter:
                 current_horizon = args.traj_time
             else:
                 current_horizon = min(
-                    args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
+                    args.traj_time + args.horizon_rate * (rel_itr - args.horizon_start_iter) / 1000,
                     args.horizon_max
                 )
             n_current_points = int(round(current_horizon / args.traj_dt)) + 1
@@ -857,26 +881,26 @@ if __name__ == '__main__':
                 deriv_loss = torch.tensor(0.0, device=device)
 
             # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
-            if itr <= args.energy_warmup:
+            if rel_itr <= args.energy_warmup:
                 ew = 0.0
-            elif itr <= args.energy_warmup + args.energy_rampup:
-                ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
+            elif rel_itr <= args.energy_warmup + args.energy_rampup:
+                ew = args.energy_weight * (rel_itr - args.energy_warmup) / args.energy_rampup
             else:
                 ew = args.energy_weight
 
             # Jacobian weight curriculum
-            if itr <= args.jac_warmup:
+            if rel_itr <= args.jac_warmup:
                 jw = 0.0
-            elif itr <= args.jac_warmup + args.jac_rampup:
-                jw = args.jac_weight * (itr - args.jac_warmup) / args.jac_rampup
+            elif rel_itr <= args.jac_warmup + args.jac_rampup:
+                jw = args.jac_weight * (rel_itr - args.jac_warmup) / args.jac_rampup
             else:
                 jw = args.jac_weight
 
             # Derivative matching weight curriculum
-            if itr <= args.deriv_warmup:
+            if rel_itr <= args.deriv_warmup:
                 dw = 0.0
-            elif itr <= args.deriv_warmup + args.deriv_rampup:
-                dw = args.deriv_weight * (itr - args.deriv_warmup) / args.deriv_rampup
+            elif rel_itr <= args.deriv_warmup + args.deriv_rampup:
+                dw = args.deriv_weight * (rel_itr - args.deriv_warmup) / args.deriv_rampup
             else:
                 dw = args.deriv_weight
 
@@ -884,11 +908,15 @@ if __name__ == '__main__':
             loss.backward()
             clip_grad_norm_(node_func.parameters(), max_norm=1.0)
             node_optimizer.step()
-            node_scheduler.step()
+            if node_scheduler:
+                node_scheduler.step()
 
             if itr % args.log_every == 0:
                 with torch.no_grad():
-                    batch_mse = torch.mean((pred_y - batch_y) ** 2).item()
+                    if pred_y is not None:
+                        batch_mse = torch.mean((pred_y - batch_y) ** 2).item()
+                    else:
+                        batch_mse = 0.0
 
                 log['Neural ODE']['iters_fast'].append(itr)
                 log['Neural ODE']['batch_mse'].append(batch_mse)
@@ -909,7 +937,7 @@ if __name__ == '__main__':
                         'neural_ode/jac_weight': jw,
                         'neural_ode/deriv_loss': deriv_loss.item(),
                         'neural_ode/deriv_weight': dw,
-                        'neural_ode/lr': node_scheduler.get_last_lr()[0],
+                        'neural_ode/lr': node_optimizer.param_groups[0]['lr'],
                         'neural_ode/nfe': nfe,
                         'neural_ode/train_horizon': current_horizon,
                         'neural_ode/step': itr,
@@ -962,21 +990,35 @@ if __name__ == '__main__':
         print(f'\n=== Training {model_name} ===')
         optimizer = optim.Adam(seq_model.parameters(), lr=args.eta_max,
                                weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
-        )
+        
+        if args.resume_iter > 0:
+            fname = model_name.lower().replace(' ', '_')
+            ckpt_path = os.path.join(model_dir, 'checkpoints', f'{fname}_iter{args.resume_iter}.pt')
+            if os.path.exists(ckpt_path):
+                print(f'Loading checkpoint: {ckpt_path}')
+                seq_model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            else:
+                print(f'Warning: Checkpoint {ckpt_path} not found')
+
+        if args.constant_lr:
+            scheduler = None
+        else:
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=args.lr_restart_period, T_mult=1, eta_min=args.eta_min
+            )
         start = time.time()
         prefix = wb_prefix[model_name]
 
-        for itr in range(1, args.niters + 1):
+        for itr in range(args.resume_iter + 1, args.resume_iter + args.niters + 1):
             optimizer.zero_grad()
+            rel_itr = itr - args.resume_iter
 
             # Horizon curriculum
-            if itr < args.horizon_start_iter:
+            if rel_itr < args.horizon_start_iter:
                 current_horizon = args.traj_time
             else:
                 current_horizon = min(
-                    args.traj_time + args.horizon_rate * (itr - args.horizon_start_iter) / 1000,
+                    args.traj_time + args.horizon_rate * (rel_itr - args.horizon_start_iter) / 1000,
                     args.horizon_max
                 )
             n_current_points = int(round(current_horizon / args.traj_dt)) + 1
@@ -1000,10 +1042,10 @@ if __name__ == '__main__':
                 energy_loss = torch.tensor(0.0, device=device)
 
             # Curriculum: energy weight = 0 during warmup, linear ramp, then constant
-            if itr <= args.energy_warmup:
+            if rel_itr <= args.energy_warmup:
                 ew = 0.0
-            elif itr <= args.energy_warmup + args.energy_rampup:
-                ew = args.energy_weight * (itr - args.energy_warmup) / args.energy_rampup
+            elif rel_itr <= args.energy_warmup + args.energy_rampup:
+                ew = args.energy_weight * (rel_itr - args.energy_warmup) / args.energy_rampup
             else:
                 ew = args.energy_weight
 
@@ -1011,7 +1053,8 @@ if __name__ == '__main__':
             loss.backward()
             clip_grad_norm_(seq_model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
+            if scheduler:
+                scheduler.step()
 
             if itr % args.log_every == 0:
                 with torch.no_grad():
@@ -1029,7 +1072,7 @@ if __name__ == '__main__':
                         f'{prefix}/batch_mse': batch_mse,
                         f'{prefix}/energy_loss': energy_loss.item(),
                         f'{prefix}/energy_weight': ew,
-                        f'{prefix}/lr': scheduler.get_last_lr()[0],
+                        f'{prefix}/lr': optimizer.param_groups[0]['lr'],
                         f'{prefix}/train_horizon': current_horizon,
                         f'{prefix}/step': itr,
                     })
