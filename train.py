@@ -7,10 +7,7 @@ import torch
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import matplotlib
-try:
-    matplotlib.use('TkAgg')
-except ImportError:
-    pass
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 try:
@@ -20,7 +17,8 @@ except ImportError:
     HAS_WANDB = False
 
 from dynamics import get_system, SYSTEMS
-from models import (ODEFunc, SequencePredictor, RunningAverageMeter,
+from models import (ODEFunc, SequencePredictor, MLPPredictor,
+                    RunningAverageMeter,
                     count_parameters, compute_default_hidden_sizes)
 
 # ---------------------------------------------------------------------------
@@ -42,9 +40,9 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--system', type=str, default='double_pendulum',
                     choices=list(SYSTEMS.keys()))
 parser.add_argument('--models', type=str, default='both',
-                    choices=['node', 'rnn', 'both'],
+                    choices=['node', 'rnn', 'mlp', 'both'],
                     help='Which models to train: node (Neural ODE only), '
-                         'rnn (RNN/GRU/LSTM only), both (default)')
+                         'rnn (RNN/GRU/LSTM only), mlp (MLP only), both (default)')
 # ODE solver
 parser.add_argument('--method', type=str,
                     choices=['dopri5', 'adams', 'euler', 'rk4'], default='dopri5')
@@ -121,6 +119,7 @@ parser.add_argument('--node_hidden', type=int, default=None)
 parser.add_argument('--rnn_hidden', type=int, default=None)
 parser.add_argument('--gru_hidden', type=int, default=None)
 parser.add_argument('--lstm_hidden', type=int, default=None)
+parser.add_argument('--mlp_hidden', type=int, default=None)
 # Output
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--resume_iter', type=int, default=0,
@@ -136,7 +135,7 @@ system['add_cli_args'](parser)
 args = parser.parse_args()
 
 # Fill in hidden sizes that weren't explicitly set
-H_node, H_rnn, H_gru, H_lstm = compute_default_hidden_sizes(
+H_node, H_rnn, H_gru, H_lstm, H_mlp = compute_default_hidden_sizes(
     repr_dim, args.num_layers, args.target_params)
 if args.node_hidden is None:
     args.node_hidden = H_node
@@ -146,6 +145,8 @@ if args.gru_hidden is None:
     args.gru_hidden = H_gru
 if args.lstm_hidden is None:
     args.lstm_hidden = H_lstm
+if args.mlp_hidden is None:
+    args.mlp_hidden = H_mlp
 
 if args.adjoint:
     from torchdiffeq import odeint_adjoint as odeint
@@ -448,11 +449,13 @@ if __name__ == '__main__':
     # --- Build models (repr_dim inputs/outputs) ---
     train_node = args.models in ('node', 'both')
     train_rnn = args.models in ('rnn', 'both')
+    train_mlp = args.models in ('mlp', 'both')
 
     models = {}
     seq_models = {}
     names = []
-    colors = {'Neural ODE': 'blue', 'RNN': 'red', 'GRU': 'orange', 'LSTM': 'purple'}
+    colors = {'Neural ODE': 'blue', 'RNN': 'red', 'GRU': 'orange',
+              'LSTM': 'purple', 'MLP': 'green'}
 
     if train_node:
         node_func = ODEFunc(repr_dim, args.node_hidden, args.num_layers).to(device)
@@ -469,6 +472,13 @@ if __name__ == '__main__':
         seq_models = {'RNN': rnn_model, 'GRU': gru_model, 'LSTM': lstm_model}
         models.update(seq_models)
         names.extend(['RNN', 'GRU', 'LSTM'])
+
+    if train_mlp:
+        mlp_model = MLPPredictor(repr_dim, args.mlp_hidden,
+                                 args.num_layers).to(device)
+        seq_models['MLP'] = mlp_model
+        models['MLP'] = mlp_model
+        names.append('MLP')
 
     print('=' * 50)
     print(f'System: {system["name"]} ({state_dim}D state -> {repr_dim}D sin/cos repr)')
@@ -564,7 +574,7 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     wb_prefix = {
         'Neural ODE': 'neural_ode', 'RNN': 'rnn',
-        'GRU': 'gru', 'LSTM': 'lstm',
+        'GRU': 'gru', 'LSTM': 'lstm', 'MLP': 'mlp',
     }
     use_wandb = HAS_WANDB and not args.no_wandb
     if use_wandb:
@@ -583,7 +593,6 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Real-time plot setup
     # ------------------------------------------------------------------
-    plt.ion()
     fig_batch, (ax_bmse, ax_nfe) = plt.subplots(1, 2, figsize=(12, 4))
     fig_test, (ax_tmse, ax_ev, ax_dt, ax_ftle) = plt.subplots(1, 4, figsize=(20, 4))
     state_labels = system['state_labels']
@@ -621,8 +630,6 @@ if __name__ == '__main__':
 
         fig_batch.suptitle(f'Training {model_name} (every {args.log_every} iters)')
         fig_batch.tight_layout()
-        fig_batch.canvas.draw_idle()
-        fig_batch.canvas.flush_events()
 
     def update_test_plots(model_name):
         d = log[model_name]
@@ -645,8 +652,6 @@ if __name__ == '__main__':
 
         fig_test.suptitle(f'Test Eval — {model_name} (every {args.eval_every} iters)')
         fig_test.tight_layout()
-        fig_test.canvas.draw_idle()
-        fig_test.canvas.flush_events()
 
     def update_traj_plot(model_name, viz_pred):
         """Update the fixed trajectory figure (3 trajectories x 5 columns)."""
@@ -688,8 +693,6 @@ if __name__ == '__main__':
 
         fig_traj.suptitle(f'Fixed Trajectories — {model_name}')
         fig_traj.tight_layout()
-        fig_traj.canvas.draw_idle()
-        fig_traj.canvas.flush_events()
 
         if use_wandb:
             prefix = wb_prefix[model_name]
@@ -944,7 +947,7 @@ if __name__ == '__main__':
                     })
 
                 update_batch_plots('Neural ODE')
-                plt.pause(0.001)
+
 
             if itr % args.eval_every == 0:
                 test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_node(node_func)
@@ -970,7 +973,7 @@ if __name__ == '__main__':
 
                 update_test_plots('Neural ODE')
                 update_traj_plot('Neural ODE', viz_pred)
-                plt.pause(0.001)
+
 
             if itr % 1000 == 0:
                 ckpt_dir = os.path.join(model_dir, 'checkpoints')
@@ -1024,17 +1027,15 @@ if __name__ == '__main__':
             n_current_points = int(round(current_horizon / args.traj_dt)) + 1
 
             batch_y0, batch_t, batch_y, batch_y0_phys = get_batch(n_current_points)
-            rnn_input = batch_y[:-1]
-            rnn_target = batch_y[1:]
-            rnn_pred, _ = seq_model(rnn_input)
+            rnn_pred = seq_model.autoregressive_rollout(batch_y0, n_current_points)
             if args.traj_weight > 0:
-                traj_loss = torch.mean((rnn_pred - rnn_target) ** 2)
+                traj_loss = torch.mean((rnn_pred - batch_y) ** 2)
             else:
                 traj_loss = torch.tensor(0.0, device=device)
 
             # Energy conservation loss
             if args.energy_weight > 0:
-                pred_4d = sincos_to_angles(denormalize(rnn_pred))
+                pred_4d = sincos_to_angles(denormalize(rnn_pred[1:]))
                 E_pred = energy_fn(pred_4d, args)
                 E0 = energy_fn(batch_y0_phys.unsqueeze(0), args)
                 energy_loss = torch.mean(torch.abs(E_pred - E0))
@@ -1058,7 +1059,7 @@ if __name__ == '__main__':
 
             if itr % args.log_every == 0:
                 with torch.no_grad():
-                    batch_mse = torch.mean((rnn_pred - rnn_target) ** 2).item()
+                    batch_mse = torch.mean((rnn_pred - batch_y) ** 2).item()
 
                 log[model_name]['iters_fast'].append(itr)
                 log[model_name]['batch_mse'].append(batch_mse)
@@ -1078,7 +1079,7 @@ if __name__ == '__main__':
                     })
 
                 update_batch_plots(model_name)
-                plt.pause(0.001)
+
 
             if itr % args.eval_every == 0:
                 test_mse, ev, dt_val, ftle_err, viz_pred = evaluate_seq(seq_model)
@@ -1104,7 +1105,7 @@ if __name__ == '__main__':
 
                 update_test_plots(model_name)
                 update_traj_plot(model_name, viz_pred)
-                plt.pause(0.001)
+
 
             if itr % 1000 == 0:
                 ckpt_dir = os.path.join(model_dir, 'checkpoints')
@@ -1214,6 +1215,3 @@ if __name__ == '__main__':
     if use_wandb:
         wandb.log({'final/trajectory_plot': wandb.Image(fig_final)})
         wandb.finish()
-
-    plt.ioff()
-    plt.show()

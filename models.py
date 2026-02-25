@@ -39,6 +39,20 @@ class SequencePredictor(nn.Module):
         rnn_out, h_n = self.rnn(x, h0)
         return x + self.fc(rnn_out), h_n
 
+    def autoregressive_rollout(self, y0, n_steps):
+        """Autoregressive rollout with gradients. y0: (batch, state_dim).
+        Returns (n_steps, batch, state_dim) including y0."""
+        import torch
+        preds = [y0]
+        current = y0.unsqueeze(0)  # (1, batch, dim)
+        h = None
+        for _ in range(n_steps - 1):
+            rnn_out, h = self.rnn(current, h)
+            next_state = current + self.fc(rnn_out)
+            preds.append(next_state.squeeze(0))
+            current = next_state
+        return torch.stack(preds, dim=0)
+
     def predict_trajectory(self, y0, n_steps):
         """Autoregressive rollout with residual. y0: (batch, state_dim)."""
         import torch
@@ -51,6 +65,47 @@ class SequencePredictor(nn.Module):
                 next_state = current + self.fc(rnn_out)
                 preds.append(next_state.squeeze(0))
                 current = next_state
+        return torch.stack(preds, dim=0)
+
+
+class MLPPredictor(nn.Module):
+
+    def __init__(self, input_size, hidden_size, num_layers=5):
+        super().__init__()
+        layers = [nn.Linear(input_size, hidden_size), nn.Tanh()]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hidden_size, hidden_size), nn.Tanh()]
+        layers.append(nn.Linear(hidden_size, input_size))
+        self.net = nn.Sequential(*layers)
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0, std=0.1)
+                nn.init.constant_(m.bias, val=0)
+
+    def forward(self, x, h0=None):
+        """Teacher-forcing forward with residual. x: (seq_len, batch, state_dim)."""
+        return x + self.net(x), None
+
+    def autoregressive_rollout(self, y0, n_steps):
+        """Autoregressive rollout with gradients. y0: (batch, state_dim).
+        Returns (n_steps, batch, state_dim) including y0."""
+        import torch
+        preds = [y0]
+        current = y0
+        for _ in range(n_steps - 1):
+            current = current + self.net(current)
+            preds.append(current)
+        return torch.stack(preds, dim=0)
+
+    def predict_trajectory(self, y0, n_steps):
+        """Autoregressive rollout without gradients. y0: (batch, state_dim)."""
+        import torch
+        preds = [y0]
+        current = y0
+        with torch.no_grad():
+            for _ in range(n_steps - 1):
+                current = current + self.net(current)
+                preds.append(current)
         return torch.stack(preds, dim=0)
 
 
@@ -104,4 +159,7 @@ def compute_default_hidden_sizes(state_dim, num_layers=5, target_params=100000):
     # = (8L-4)*H^2 + (5D + 8L)*H + D
     H_lstm = _solve(8 * L - 4, 5 * D + 8 * L, D - target_params)
 
-    return H_node, H_rnn, H_gru, H_lstm
+    # MLP: same architecture as NODE (no RNN cell overhead)
+    H_mlp = H_node
+
+    return H_node, H_rnn, H_gru, H_lstm, H_mlp
